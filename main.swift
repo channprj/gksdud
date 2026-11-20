@@ -808,6 +808,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     var sourceSwitchOwner: pid_t?
     var frontmostPID: () -> pid_t? = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
     var appSourceFocus = AppSourceFocus()
+    var keyboardFocus = KeyboardFocusWatch()
+    var focusCheckScheduled = false
+    var focusRecheck = false
+    // The source before a launcher's own selection, kept until the overlay is entered or the check goes stale.
+    var pendingOverlayOrigin: String?
+    var pendingOverlayOriginAt: TimeInterval = 0
+    var sourceChangedAt: TimeInterval = 0
+    var alfredLocaleCache: (at: TimeInterval, id: String?)?
+    var alfredLocale: () -> String? = {
+        AlfredForcedKeyboard.locale(in: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Alfred"))
+    }
+    var focusedWindowOwner: () -> pid_t? = { KeyboardFocus.owner() }
     lazy var appSourcesSettings = AppSourcesSettings(owner: self)
     // The source a switch is on its way to, and one that waits for it to land.
     var switchLanding: String?
@@ -890,6 +902,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
     func stopKeyTap() {
         appSourceFocus.cancel()
+        keyboardFocus.stop()
+        dropKeyboardOverlay()
         cancelSourceSwitch()
         optionInput.cancel()
         cancelCapsRestore()
@@ -910,7 +924,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         syncCapsPreservation()
         // ESC shares the long-press transition, so it runs while either is on.
         if !engine.active || !engine.longPressCapsLock && !engine.escapeToEnglish { cancelLongPress() }
-        guard engine.active, !engine.paused, keyTap == nil else { updatePressAccess(); return }
+        guard engine.active, !engine.paused, keyTap == nil else {
+            if !engine.active || engine.paused { stopKeyboardFocusWatch() }
+            updatePressAccess(); return
+        }
         let mask = (CGEventMask(1) << CGEventType.keyDown.rawValue) | (CGEventMask(1) << CGEventType.keyUp.rawValue) | (CGEventMask(1) << CGEventType.flagsChanged.rawValue) | (CGEventMask(1) << CGEventType.leftMouseDown.rawValue) | (CGEventMask(1) << CGEventType.rightMouseDown.rawValue) | (CGEventMask(1) << CGEventType.otherMouseDown.rawValue)
         guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
             eventsOfInterest: mask, callback: { _, type, event, info in
@@ -924,6 +941,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     // Retain owned physical key-ups to avoid an extra native release.
                     if let tap = owner.keyTap { CGEvent.tapEnable(tap: tap, enable: true) }
                     return Unmanaged.passUnretained(event)
+                }
+                // After this event is delivered, so a non-activating window (Alfred's search) exists to be read.
+                if owner.inputSwitchReady && (type == .keyDown || type == .keyUp || type == .flagsChanged
+                    || type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown) {
+                    owner.scheduleFocusCheck()
                 }
                 // Keys this app posts again, such as ones held while a switch landed, act only once.
                 let ours = event.getIntegerValueField(.eventSourceUserData) == owner.nativePulseMarker
@@ -1011,6 +1033,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         keyTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), keyTapSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        startKeyboardFocusWatch()
         updatePressAccess()
     }
     // With Universal Control in front, the keys go to another Mac. Only with a keyboard mapped here: others have nothing to
@@ -1369,6 +1392,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         })
         appSourceFocus.begin(frontmostPID())
         observers.append(center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notice in
+            // Before the activation's own source, so a search overlay does not restore into the app that just came forward.
+            self?.noteKeyboardFocus()
             self?.optionInput.cancel(focusChanged: true)
             self?.updateRemoteHold()
             if let self, let owner = self.sourceSwitchOwner, owner != self.frontmostPID() { self.cancelSourceSwitch() }
@@ -1376,7 +1401,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         })
         observers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             // Keys held for a switch must not go on under the lock screen or after waking.
-            self?.appSourceFocus.cancel(); self?.cancelSourceSwitch(discardKeys: true); self?.optionInput.cancel()
+            self?.appSourceFocus.cancel(); self?.dropKeyboardOverlay(); self?.cancelSourceSwitch(discardKeys: true); self?.optionInput.cancel()
         })
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.recover() })
@@ -1575,6 +1600,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     @objc func inputSourceChanged() {
         RunLoop.main.perform(inModes: [.common]) { [weak self] in
             guard let self else { return }
+            self.sourceChangedAt = ProcessInfo.processInfo.systemUptime
             let id = self.currentSource?.id
             if let id { self.sourceHistory.note(id) }
             self.observeSourceArrival(id)
@@ -1796,7 +1822,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         do { try engine.restore(); lastError = ""; stickyError = ""; repairFailed = false; refreshStatus() } catch { report(error) }
         resetSelection(); syncCapsPreservation(); updatePressAccess(); refreshKeyboardState()
     }
-    func recover() { appSourceFocus.cancel(); cancelSourceSwitch(); sourceCache = nil; engine.nextFailure.clear(); engine.followedNext = nil; observedCaps = nil; optionInput.cancel(); if capsRestoreTasks.isEmpty { englishCaps.switching = false }; cancelLongPress(); longPress = LongPressState(); pressGate.held.removeAll(); nativeRemote = NativeRemoteGate(); spaceGate = SpaceComboGate(); sourceKeyGate.held.removeAll(); for delay in [0.5, 2.0, 5.0] { DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.repair() } } }
+    func recover() { appSourceFocus.cancel(); dropKeyboardOverlay(); cancelSourceSwitch(); sourceCache = nil; engine.nextFailure.clear(); engine.followedNext = nil; observedCaps = nil; optionInput.cancel(); if capsRestoreTasks.isEmpty { englishCaps.switching = false }; cancelLongPress(); longPress = LongPressState(); pressGate.held.removeAll(); nativeRemote = NativeRemoteGate(); spaceGate = SpaceComboGate(); sourceKeyGate.held.removeAll(); for delay in [0.5, 2.0, 5.0] { DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.repair() } } }
     // The tap does not see Caps Lock on another user's login window, and leaves it alone on the lock screen. Coming back
     // with English (or Korean showing the English case) selected, the lock as left there is the English case. A restore on
     // its way finishes first: unlocking can land in Korean while its input method turns the lock off.
@@ -1808,7 +1834,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     // The 1-second repair follows the lock too; this only makes it sooner.
     @objc func screenLockChanged(_ notification: Notification) {
         // Keys held for a switch are dropped when locking: released now, they would go into the password field.
-        appSourceFocus.cancel(); cancelSourceSwitch(discardKeys: notification.name.rawValue == "com.apple.screenIsLocked")
+        appSourceFocus.cancel(); dropKeyboardOverlay(); cancelSourceSwitch(discardKeys: notification.name.rawValue == "com.apple.screenIsLocked")
         // Key releases on the lock screen never reached the tap, so keys held before it count as released.
         if notification.name.rawValue == "com.apple.screenIsUnlocked" { recover() }
         repair()

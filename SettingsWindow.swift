@@ -184,6 +184,7 @@ extension AppDelegate {
         separator(in: extras)
         heading("앱 포커스 시 입력 소스 전환", in: extras)
         appSourcesSettings.install(in: extras)
+        hint("앱을 활성화하지 않는 창도 전환합니다. Alfred 검색창은 이 설정을 꺼도 Alfred에 지정한 입력 소스를 따릅니다.", in: extras)
         separator(in: extras)
         heading("기타", in: extras)
         escapeSwitch.target = self; escapeSwitch.action = #selector(toggleFeature(_:))
