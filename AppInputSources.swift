@@ -31,13 +31,27 @@ struct AppSourceRules {
 }
 
 // Only app activation requests a default. Source changes and window changes within the app never request one.
+// A window that takes the keyboard without activating its app (Alfred's search) is tracked separately, and never
+// becomes `pid`: coming back to the app underneath is not a switch to it.
 struct AppSourceFocus {
+    enum Change: Equatable {
+        case none
+        case entered(pid_t)
+        case returned(String, enforced: String?)
+        case abandoned
+    }
     // The lock screen, and the other Mac under Universal Control, take the front without the user leaving the app.
     static let passing: Set<String> = ["com.apple.loginwindow", universalControlID]
     private(set) var pid: pid_t?
     private(set) var generation = 0
     private var away = false
     private var left: pid_t?
+    // The app whose window has the keyboard without being frontmost, and the frontmost app it covers.
+    private(set) var overlay: pid_t?
+    private(set) var covered: pid_t?
+    private(set) var origin: String?
+    private(set) var enforced: String?
+    private(set) var overlayGeneration = 0
     mutating func activate(_ pid: pid_t, frontmost: pid_t, passing: Bool = false) -> Int? {
         if passing {
             if !away { away = true; left = self.pid }
@@ -53,8 +67,40 @@ struct AppSourceFocus {
     }
     // The app in front when this starts had no activation to see.
     mutating func begin(_ pid: pid_t?) { if self.pid == nil { self.pid = pid } }
+    // A hand switch wins over an activation on its way. An overlay already showing is not that request.
     mutating func cancel() { generation += 1 }
     func accepts(_ generation: Int, pid: pid_t) -> Bool { self.generation == generation && self.pid == pid }
+    // `focused` is set only for an app this should follow. Anything else, including no focus, is the overlay going away.
+    // Replacing one such window with another keeps the source from before the first: the second may already have switched.
+    mutating func note(focused: pid_t?, frontmost: pid_t, source: String?) -> Change {
+        if let covered, frontmost != covered { dropOverlay(); return .abandoned }
+        if let focused, focused != frontmost {
+            if overlay == focused { return .none }
+            let replacing = overlay != nil
+            overlay = focused
+            if !replacing { covered = frontmost; origin = source }
+            overlayGeneration += 1
+            return .entered(focused)
+        }
+        guard overlay != nil else { return .none }
+        let saved = origin, forced = enforced
+        dropOverlay()
+        return saved.map { .returned($0, enforced: forced) } ?? .none
+    }
+    mutating func setEnforced(_ id: String?) { enforced = id }
+    // Invalidates a switch on the way, including one that is putting the old source back. No key is sent from here.
+    mutating func dropOverlay() {
+        overlay = nil; covered = nil; origin = nil; enforced = nil; overlayGeneration += 1
+    }
+    func acceptsOverlay(_ generation: Int, pid: pid_t) -> Bool { overlayGeneration == generation && overlay == pid }
+    func acceptsReturn(_ generation: Int) -> Bool { overlayGeneration == generation && overlay == nil }
+    // `early` is the source from before the overlay's own selection. A selection that just landed on the target
+    // replaced it, so the one before that selection is where typing was.
+    static func overlayOrigin(early: String?, current: String?, target: String?, previous: String?, changedRecently: Bool) -> String? {
+        if let early { return early }
+        if changedRecently, let current, current == target, let previous { return previous }
+        return current
+    }
 }
 
 extension AppDelegate {
@@ -102,6 +148,251 @@ extension AppDelegate {
             }
             self.appSourcesSettings.showError("입력 소스를 전환하지 못했습니다.", bundleID: bundle)
         }
+    }
+    // The shortcut still switches while an overlay has the keyboard. The per-app list is a separate choice.
+    var inputSwitchReady: Bool {
+        engine.active && !engine.paused && engine.accessibilityTrusted() && !engine.sessionAway()
+    }
+    // Alfred's Force Keyboard, read from its preferences. Empty means Alfred keeps whatever is current.
+    // An app rule, when the feature is on, wins. A rule whose source is not in use does not fall through to this.
+    func overlayTarget(bundle: String) -> InputSourceIdentity? {
+        if appSourceRules.enabled, let rule = appSourceRules.rules.first(where: { $0.bundleID == bundle }) {
+            return appSourceChoices.first { $0.id == rule.sourceID }
+        }
+        guard bundle == AlfredForcedKeyboard.bundleID, let id = alfredForcedID() else { return nil }
+        return enabledSources().first { $0.id == id }
+    }
+    func overlayManaged(_ bundle: String) -> Bool {
+        if bundle == Bundle.main.bundleIdentifier || AppSourceFocus.passing.contains(bundle) { return false }
+        if appSourceRules.enabled && appSourceRules.rules.contains(where: { $0.bundleID == bundle }) { return true }
+        return bundle == AlfredForcedKeyboard.bundleID && alfredForcedID() != nil
+    }
+    func alfredForcedID() -> String? {
+        let now = ProcessInfo.processInfo.systemUptime
+        if let alfredLocaleCache, now - alfredLocaleCache.at < 2 { return alfredLocaleCache.id }
+        let id = alfredLocale()
+        alfredLocaleCache = (now, id)
+        return id
+    }
+    // One check after the current event, so a launcher has shown its window and selected its source first.
+    func scheduleFocusCheck() {
+        guard inputSwitchReady else { return }
+        if pendingOverlayOrigin == nil {
+            pendingOverlayOrigin = currentSource?.id
+            pendingOverlayOriginAt = ProcessInfo.processInfo.systemUptime
+        }
+        focusRecheck = true
+        guard !focusCheckScheduled else { return }
+        focusCheckScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.focusCheckScheduled = false
+            self.noteKeyboardFocus()
+        }
+    }
+    func noteKeyboardFocus() {
+        guard let frontmost = frontmostPID() else { return }
+        guard inputSwitchReady else { dropKeyboardOverlay(); return }
+        let recheck = focusRecheck
+        focusRecheck = false
+        guard let focusedPID = focusedWindowOwner() else {
+            // No window to read. An app that came forward is not the overlay closing.
+            if let covered = appSourceFocus.covered, covered != frontmost { dropKeyboardOverlay() }
+            else { scheduleOverlayRecheck(recheck) }
+            return
+        }
+        let bundle = NSRunningApplication(processIdentifier: focusedPID)?.bundleIdentifier
+        if bundle.map(AppSourceFocus.passing.contains) == true { dropKeyboardOverlay(); return }
+        // This app's window is not an overlay. Passing it as none lets a real activation cancel the search.
+        let managed = focusedPID != getpid() && (bundle.map { overlayManaged($0) } ?? false)
+        let early = pendingOverlayOrigin, earlyAt = pendingOverlayOriginAt
+        let currentID = currentSource?.id
+        let target = bundle.flatMap { overlayTarget(bundle: $0) }
+        let recent = ProcessInfo.processInfo.systemUptime - sourceChangedAt < 0.2
+        let source = AppSourceFocus.overlayOrigin(early: early, current: currentID, target: target?.id,
+            previous: currentID.flatMap { sourceHistory.previous(of: $0) }, changedRecently: recent)
+        let change = appSourceFocus.note(focused: managed ? focusedPID : nil, frontmost: frontmost, source: source)
+        let token = appSourceFocus.overlayGeneration
+        if change != .none || ProcessInfo.processInfo.systemUptime - earlyAt > 0.35 { pendingOverlayOrigin = nil }
+        switch change {
+        case .none:
+            // The key that opens a launcher is delivered before its window exists.
+            if appSourceFocus.overlay == nil { scheduleOverlayRecheck(recheck) }
+        case .abandoned: break
+        case .entered(let pid):
+            appSourceFocus.setEnforced(target?.id)
+            if let bundle, let target { enforceOverlay(bundle, pid: pid, generation: token, target: target) }
+        case .returned(let origin, let enforced):
+            restoreOverlay(origin, generation: token, enforced: enforced)
+        }
+    }
+    // One look later, not a poll. The event's own check has already kept the source from before the launcher.
+    private func scheduleOverlayRecheck(_ enabled: Bool) {
+        guard enabled, pendingOverlayOrigin != nil, !focusCheckScheduled else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in self?.noteKeyboardFocus() }
+    }
+    func dropKeyboardOverlay() {
+        pendingOverlayOrigin = nil
+        appSourceFocus.dropOverlay()
+    }
+    // The owner is the app still in front, not the overlay: a switch is cancelled when its owner is no longer frontmost.
+    // Alfred selects at the end of the event, and the front app's input source can snap that straight back, so check again.
+    private func enforceOverlay(_ bundle: String, pid: pid_t, generation: Int, target: InputSourceIdentity, delay: TimeInterval = 0.08, confirms: Int = 2) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.appSourceFocus.acceptsOverlay(generation, pid: pid), self.inputSwitchReady,
+                  let covered = self.appSourceFocus.covered, self.frontmostPID() == covered else { return }
+            let ruled = self.appSourceRules.enabled && self.appSourceRules.rules.contains { $0.bundleID == bundle }
+            if ruled { self.appSourcesSettings.showError(nil, bundleID: bundle) }
+            guard let current = self.logicalSource else { return }
+            if current.id == target.id {
+                if confirms > 0 { self.enforceOverlay(bundle, pid: pid, generation: generation, target: target, delay: 0.2, confirms: confirms - 1) }
+                return
+            }
+            guard let pulse = nativeSwitchPulse(keyCode: self.engine.target.keyCode, marker: self.nativePulseMarker) else {
+                if ruled { self.appSourcesSettings.showError("입력 소스를 전환하지 못했습니다.", bundleID: bundle) }
+                return
+            }
+            self.cancelLongPress()
+            self.rememberCapsBeforeSwitch()
+            let attempt = self.landingGeneration
+            let switched = self.switchSource(to: target, from: current, pulse: pulse, owner: covered)
+            if switched || attempt != self.landingGeneration {
+                if confirms > 0 { self.enforceOverlay(bundle, pid: pid, generation: generation, target: target, delay: 0.2, confirms: confirms - 1) }
+                return
+            }
+            if ruled { self.appSourcesSettings.showError("입력 소스를 전환하지 못했습니다.", bundleID: bundle) }
+        }
+    }
+    // Restores the source from before the overlay selected its own. One later check undoes that source coming back,
+    // and leaves a source the user picked after the overlay closed.
+    private func restoreOverlay(_ origin: String, generation: Int, enforced: String?, again: Bool = true) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            guard let self, self.appSourceFocus.acceptsReturn(generation), self.inputSwitchReady,
+                  let current = self.logicalSource, current.id != origin,
+                  let target = self.enabledSources().first(where: { $0.id == origin }),
+                  let pulse = nativeSwitchPulse(keyCode: self.engine.target.keyCode, marker: self.nativePulseMarker) else { return }
+            self.cancelLongPress()
+            self.rememberCapsBeforeSwitch()
+            _ = self.switchSource(to: target, from: current, pulse: pulse, owner: self.frontmostPID())
+            guard again, let enforced else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                guard let self, self.appSourceFocus.acceptsReturn(generation), self.switchLanding == nil,
+                      self.currentSource?.id == enforced else { return }
+                self.restoreOverlay(origin, generation: generation, enforced: nil, again: false)
+            }
+        }
+    }
+    func startKeyboardFocusWatch() {
+        keyboardFocus.onChange = { [weak self] in self?.scheduleFocusCheck() }
+        keyboardFocus.start()
+        scheduleFocusCheck()
+    }
+    func stopKeyboardFocusWatch() {
+        let running = keyboardFocus.running
+        keyboardFocus.stop()
+        if running { dropKeyboardOverlay() }
+    }
+}
+
+// Alfred stores Force Keyboard under the preferences bundle named in ~/Library/Application Support/Alfred/prefs.json.
+// The hash is one path component, and the bundle stays inside that folder: the file is not an arbitrary path.
+struct AlfredForcedKeyboard {
+    static let bundleID = "com.runningwithcrayons.Alfred"
+    static func locale(in directory: URL) -> String? {
+        let root = directory.standardizedFileURL.resolvingSymlinksInPath()
+        guard let data = try? Data(contentsOf: root.appendingPathComponent("prefs.json")),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let current = object["current"] as? String, let hash = object["localhash"] as? String,
+              validHash(hash) else { return nil }
+        let bundle = URL(fileURLWithPath: current).standardizedFileURL.resolvingSymlinksInPath()
+        guard bundle.lastPathComponent == "Alfred.alfredpreferences", contains(root, bundle) else { return nil }
+        let plist = bundle.appendingPathComponent("preferences/local/\(hash)/keyboard/prefs.plist").standardizedFileURL
+        guard contains(bundle, plist), let dict = NSDictionary(contentsOf: plist),
+              let locale = dict["locale"] as? String, !locale.isEmpty else { return nil }
+        return locale
+    }
+    private static func validHash(_ hash: String) -> Bool {
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        return !hash.isEmpty && hash.count <= 128 && hash.unicodeScalars.allSatisfy(allowed.contains)
+    }
+    private static func contains(_ root: URL, _ url: URL) -> Bool {
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        return url.path.hasPrefix(prefix)
+    }
+}
+
+enum KeyboardFocus {
+    // The focused window first: a non-activating panel is a window of an app that is not frontmost.
+    static func owner() -> pid_t? {
+        let system = AXUIElementCreateSystemWide()
+        if let pid = pid(system, kAXFocusedWindowAttribute as CFString) { return pid }
+        return pid(system, kAXFocusedApplicationAttribute as CFString)
+    }
+    private static func pid(_ element: AXUIElement, _ attribute: CFString) -> pid_t? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success, let value,
+              CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(unsafeBitCast(value, to: AXUIElement.self), &pid) == .success, pid > 0 else { return nil }
+        return pid
+    }
+}
+
+// Focus notifications are per app. The system-wide element does not accept them.
+final class KeyboardFocusWatch {
+    var onChange: () -> Void = {}
+    private var observer: AXObserver?
+    private var watched: Set<pid_t> = []
+    private var notices: [NSObjectProtocol] = []
+    var running: Bool { observer != nil }
+    func start() {
+        guard observer == nil else { return }
+        var created: AXObserver?
+        guard AXObserverCreate(getpid(), { _, _, _, refcon in
+            guard let refcon else { return }
+            let watch = Unmanaged<KeyboardFocusWatch>.fromOpaque(refcon).takeUnretainedValue()
+            DispatchQueue.main.async { [weak watch] in watch?.onChange() }
+        }, &created) == .success, let created else { return }
+        observer = created
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
+        let center = NSWorkspace.shared.notificationCenter
+        notices.append(center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] notice in
+            guard let app = notice.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            self?.watch(app.processIdentifier)
+        })
+        notices.append(center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] notice in
+            guard let app = notice.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            self?.unwatch(app.processIdentifier)
+        })
+        for app in NSWorkspace.shared.runningApplications { watch(app.processIdentifier) }
+    }
+    func stop() {
+        guard let observer else { return }
+        let pids = watched
+        for pid in pids { unwatch(pid) }
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        self.observer = nil
+        watched.removeAll()
+        for notice in notices { NSWorkspace.shared.notificationCenter.removeObserver(notice) }
+        notices.removeAll()
+    }
+    private func watch(_ pid: pid_t) {
+        guard let observer, pid > 0, pid != getpid(), !watched.contains(pid) else { return }
+        let element = AXUIElementCreateApplication(pid)
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        let window = AXObserverAddNotification(observer, element, kAXFocusedWindowChangedNotification as CFString, refcon)
+        let focused = AXObserverAddNotification(observer, element, kAXFocusedUIElementChangedNotification as CFString, refcon)
+        if axRegistered(window) || axRegistered(focused) { watched.insert(pid) }
+    }
+    private func unwatch(_ pid: pid_t) {
+        guard let observer else { return }
+        let element = AXUIElementCreateApplication(pid)
+        AXObserverRemoveNotification(observer, element, kAXFocusedWindowChangedNotification as CFString)
+        AXObserverRemoveNotification(observer, element, kAXFocusedUIElementChangedNotification as CFString)
+        watched.remove(pid)
+    }
+    private func axRegistered(_ error: AXError) -> Bool {
+        error == .success || error.rawValue == AXError.notificationAlreadyRegistered.rawValue
     }
 }
 
@@ -320,6 +611,60 @@ func runAppSourceTests() {
     _ = unknown.activate(55, frontmost: 55, passing: true)
     precondition(unknown.activate(101, frontmost: 101) != nil, "With no app known to have been in front, there is none to come back to")
 
+    var overlay = AppSourceFocus()
+    precondition(overlay.note(focused: nil, frontmost: 1, source: "ko") == .none)
+    precondition(overlay.note(focused: 1, frontmost: 1, source: "ko") == .none, "The frontmost app's own window is not an overlay")
+    precondition(overlay.note(focused: 9, frontmost: 1, source: "ko") == .entered(9))
+    let overlayToken = overlay.overlayGeneration
+    precondition(overlay.acceptsOverlay(overlayToken, pid: 9))
+    precondition(overlay.note(focused: 9, frontmost: 1, source: "en") == .none, "The same overlay does not ask again")
+    precondition(overlay.note(focused: 10, frontmost: 1, source: "en") == .entered(10))
+    precondition(overlay.note(focused: 1, frontmost: 1, source: "en") == .returned("ko", enforced: nil),
+        "A second overlay keeps the source from before the first")
+    precondition(overlay.acceptsReturn(overlay.overlayGeneration))
+    precondition(overlay.note(focused: 9, frontmost: 1, source: "abc") == .entered(9), "After it closes, the next one starts again")
+    overlay.setEnforced("abc")
+    let enforcedToken = overlay.overlayGeneration
+    overlay.cancel()
+    precondition(overlay.acceptsOverlay(enforcedToken, pid: 9), "A hand switch does not drop an overlay that is already showing")
+    precondition(overlay.note(focused: nil, frontmost: 1, source: "ko") == .returned("abc", enforced: "abc"))
+    precondition(overlay.note(focused: 9, frontmost: 1, source: "ko") == .entered(9))
+    let abandoned = overlay.overlayGeneration
+    precondition(overlay.note(focused: 9, frontmost: 2, source: "ko") == .abandoned)
+    precondition(!overlay.acceptsOverlay(abandoned, pid: 9) && !overlay.acceptsReturn(abandoned),
+        "Another app in front is not the overlay closing, and is not a switch back")
+    var noOrigin = AppSourceFocus()
+    precondition(noOrigin.note(focused: 9, frontmost: 1, source: nil) == .entered(9))
+    precondition(noOrigin.note(focused: nil, frontmost: 1, source: "ko") == .none)
+    precondition(AppSourceFocus.overlayOrigin(early: "ko", current: "abc", target: "abc", previous: "en", changedRecently: true) == "ko")
+    precondition(AppSourceFocus.overlayOrigin(early: nil, current: "abc", target: "abc", previous: "ko", changedRecently: true) == "ko",
+        "A selection that just landed on the overlay's source replaced the one typing was in")
+    precondition(AppSourceFocus.overlayOrigin(early: nil, current: "ja", target: "abc", previous: "ko", changedRecently: true) == "ja")
+    precondition(AppSourceFocus.overlayOrigin(early: nil, current: "abc", target: "abc", previous: "ko", changedRecently: false) == "abc")
+
+    let alfredRoot = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true).appendingPathComponent("gksdud-alfred-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: alfredRoot) }
+    let alfredKeyboard = alfredRoot.appendingPathComponent("Alfred.alfredpreferences/preferences/local/abc123/keyboard", isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: alfredKeyboard, withIntermediateDirectories: true)
+        let bundle = alfredRoot.appendingPathComponent("Alfred.alfredpreferences")
+        let keyboardPlist = alfredKeyboard.appendingPathComponent("prefs.plist")
+        try (["locale": "com.apple.keylayout.ABC"] as NSDictionary).write(to: keyboardPlist)
+        let prefs = try JSONSerialization.data(withJSONObject: ["current": bundle.path, "localhash": "abc123"])
+        try prefs.write(to: alfredRoot.appendingPathComponent("prefs.json"))
+        precondition(AlfredForcedKeyboard.locale(in: alfredRoot) == "com.apple.keylayout.ABC")
+        try (["locale": ""] as NSDictionary).write(to: keyboardPlist)
+        precondition(AlfredForcedKeyboard.locale(in: alfredRoot) == nil, "An empty Force Keyboard keeps the current source")
+        try (["locale": "com.apple.keylayout.ABC"] as NSDictionary).write(to: keyboardPlist)
+        let escaped = try JSONSerialization.data(withJSONObject: ["current": bundle.path, "localhash": "../abc123"])
+        try escaped.write(to: alfredRoot.appendingPathComponent("prefs.json"))
+        precondition(AlfredForcedKeyboard.locale(in: alfredRoot) == nil)
+        let outside = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true).appendingPathComponent("Alfred.alfredpreferences")
+        let elsewhere = try JSONSerialization.data(withJSONObject: ["current": outside.path, "localhash": "abc123"])
+        try elsewhere.write(to: alfredRoot.appendingPathComponent("prefs.json"))
+        precondition(AlfredForcedKeyboard.locale(in: alfredRoot) == nil, "The preferences bundle stays inside Alfred's folder")
+    } catch { preconditionFailure("\(error)") }
+
     let engine = Engine(defaults: defaults, discover: { [] })
     engine.accessibilityTrusted = { true }; engine.sessionAway = { false }
     let delegate = AppDelegate(engine: engine)
@@ -327,6 +672,9 @@ func runAppSourceTests() {
     precondition(!delegate.appSourcesActive)
     rules.enabled = true; defaults.set(true, forKey: "active")
     precondition(delegate.appSourcesActive)
+    rules.enabled = false
+    precondition(delegate.inputSwitchReady && !delegate.appSourcesActive, "Alfred's own source does not wait for the per-app list")
+    rules.enabled = true
     engine.paused = true; precondition(!delegate.appSourcesActive); engine.paused = false
     engine.sessionAway = { true }; precondition(!delegate.appSourcesActive); engine.sessionAway = { false }
     engine.accessibilityTrusted = { false }; precondition(!delegate.appSourcesActive); engine.accessibilityTrusted = { true }
@@ -343,8 +691,34 @@ func runAppSourceTests() {
         japanese = InputSourceIdentity(id: "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese", language: "ja")
     delegate.sourceCache = (list: [korean, abc, japanese], layouts: [abc.id])
     precondition(delegate.appSourceChoices.map(\.id) == [korean.id, abc.id])
+    let alfred = AlfredForcedKeyboard.bundleID
+    delegate.alfredLocale = { abc.id }
+    delegate.alfredLocaleCache = nil
+    rules.enabled = false
+    precondition(delegate.overlayTarget(bundle: alfred)?.id == abc.id && delegate.overlayTarget(bundle: "com.apple.Terminal") == nil,
+        "With the per-app list off, only Alfred's Force Keyboard is followed")
+    rules.enabled = true
+    rules.set(AppSourceRule(bundleID: alfred, name: "Alfred", sourceID: korean.id))
+    delegate.alfredLocaleCache = nil
+    precondition(delegate.overlayTarget(bundle: alfred)?.id == korean.id, "An app's own rule wins over Alfred's Force Keyboard")
+    rules.set(AppSourceRule(bundleID: alfred, name: "Alfred", sourceID: japanese.id))
+    delegate.alfredLocaleCache = nil
+    precondition(delegate.overlayTarget(bundle: alfred) == nil, "A rule whose source is not in use does not fall through to Alfred")
+    rules.enabled = false
+    delegate.alfredLocale = { "com.example.NotEnabled" }
+    delegate.alfredLocaleCache = nil
+    precondition(delegate.overlayTarget(bundle: alfred) == nil)
+    rules.remove(alfred)
     defaults.set(true, forKey: "addedSources"); engine.disabledSources = [abc.id]
     precondition(delegate.appSourceChoices.map(\.id) == [korean.id, japanese.id])
-    print("PASS: app source rule persistence, replacement and removal, unavailable sources, focus reentry, stale activation cancellation, the lock screen, pause/permission/session guards, the sources offered")
+    let shown = delegate.appSourceFocus.note(focused: 9, frontmost: 7, source: korean.id)
+    precondition(shown == .entered(9))
+    let shownToken = delegate.appSourceFocus.overlayGeneration
+    delegate.rememberCapsBeforeSwitch()
+    precondition(delegate.appSourceFocus.acceptsOverlay(shownToken, pid: 9))
+    delegate.stopKeyTap()
+    precondition(!delegate.appSourceFocus.acceptsOverlay(shownToken, pid: 9) && delegate.appSourceFocus.overlay == nil,
+        "Stopping the tap drops the overlay without switching")
+    print("PASS: app source rule persistence, replacement and removal, unavailable sources, focus reentry, stale activation cancellation, the lock screen, pause/permission/session guards, the sources offered, overlay focus, Alfred's forced keyboard")
 }
 #endif

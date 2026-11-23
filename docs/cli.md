@@ -104,7 +104,7 @@ gksdud source             # 현재 입력 소스 ID
 | `cycle` | `<입력 소스>,...` | 입력 소스 설정 → 한영 키로 순환과 순서 |
 | `source-key-return` | `on`, `off` | 입력 소스 설정 → 전용 전환 키를 한 번 더 누를 시 직전 입력 소스로 전환 |
 | `compatibility` | `on`, `off` | 입력 소스 설정 → 호환성 모드 |
-| `app-sources` | `on`, `off` | 앱 포커스 시 입력 소스 전환 → 활성화 |
+| `app-sources` | `on`, `off` | 앱 포커스 시 입력 소스 전환 → 활성화. 앱을 활성화하지 않는 창도 포함 |
 | `escape` | `on`, `off` | ESC 누를 시 영소문자로 변경 |
 | `universal-control` | `on`, `off` | 유니버설 컨트롤 호환 모드 |
 | `sync` | `on`, `off` | 다른 Mac과 한영 상태 동기화 (동기화 코드는 설정 창에서 확인·입력) |
