@@ -65,6 +65,7 @@ jobs:
       - name: Test release scripts
         run: |
           set -euo pipefail
+          ruby scripts/test_headver.rb
           ruby scripts/test_release.rb
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_update_tap.py
 

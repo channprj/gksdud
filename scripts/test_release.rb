@@ -135,11 +135,28 @@ class ReleaseTests < Minitest::Test
       assert_equal '1.2.1.0.1', selection.resolve(**push).fetch(:version)
       git.call('git', 'tag', 'v1.3.0', 'HEAD~1')
       assert_equal '1.3.0.1.1', selection.resolve(**push).fetch(:version)
-      # A local build numbers itself the same way.
-      FileUtils.cp("#{ROOT}/build.sh", "#{dir}/build.sh")
-      script = File.read("#{ROOT}/build.sh")[/^if \[\[ \$channel != stable.*?^fi$/m]
-      output, = Open3.capture2e({ 'channel' => 'dev' }, '/bin/bash', '-c', "set -euo pipefail\n#{script}\necho \"$GKSDUD_APP_VERSION\"", chdir: dir)
-      assert_equal '1.3.0.1.1', output.strip
+    end
+  end
+
+  def test_local_builds_reserve_weekly_headver_and_keep_explicit_release_versions
+    with_release_repository do |_, git, dir|
+      git.call('git', 'tag', 'v2.2.0')
+      git.call('git', 'commit', '--allow-empty', '-m', 'Local build')
+      FileUtils.mkdir_p("#{dir}/scripts")
+      FileUtils.cp("#{ROOT}/scripts/headver.rb", "#{dir}/scripts/headver.rb")
+      script = File.read("#{ROOT}/build.sh")[/^if \[\[ [^\n]*GKSDUD_APP_VERSION[^\n]*\n.*?^fi$/m]
+      refute_nil script
+      run = lambda do |channel, version = ''|
+        output, status = Open3.capture2e({ 'channel' => channel, 'GKSDUD_APP_VERSION' => version }, '/bin/bash', '-c',
+                                        "set -euo pipefail\n#{script}\necho \"$GKSDUD_APP_VERSION\"", chdir: dir)
+        assert status.success?, output
+        output.strip
+      end
+      week = Time.now.getlocal('+09:00').strftime('%g%V')
+      assert_equal "2.#{week}.0", run.call('dev')
+      assert_equal "2.#{week}.1", run.call('dev')
+      assert_equal '9.8.7', run.call('stable', '9.8.7')
+      assert_equal "2.#{week}.2", run.call('stable')
     end
   end
 

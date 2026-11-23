@@ -12,16 +12,9 @@ mode=${GKSDUD_SIGN_MODE:-$([[ -n $(developer_id) ]] && echo developer-id || echo
 channel=${GKSDUD_CHANNEL:-dev}
 [[ $channel =~ ^(dev|canary|stable)$ ]] || { echo 'GKSDUD_CHANNEL must be dev, canary or stable' >&2; exit 1; }
 app=gksdud identifier=io.gksdud.inputswitch
-# A local build numbers itself like the canary of its commit (scripts/resolve-release.rb): the highest prerelease or stable
-# version before the commit, in four fields, and the commits since it.
-if [[ $channel != stable && -z ${GKSDUD_APP_VERSION:-} ]]; then
-  # A prerelease tag counts only with its stable release, as one pushed before it is refused.
-  base=$({ git tag --list 'v[0-9]*' 2>/dev/null | sed 's/^/known /'; git tag --list 'v[0-9]*' --merged HEAD^ 2>/dev/null; } |
-    awk '$1 == "known" { known[$2] = 1; next }
-         /^v[0-9]+\.[0-9]+\.[0-9]+$/ { print substr($0, 2) ".0", $0 }
-         /^v[0-9]+\.[0-9]+\.[0-9]+\.[1-9][0-9]*$/ { stable = $0; sub(/\.[0-9]+$/, "", stable); if (stable in known) print substr($0, 2), $0 }' |
-    sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -1 || true)
-  if [[ -n $base ]] && count=$(git rev-list --count "${base#* }..HEAD" 2>/dev/null); then GKSDUD_APP_VERSION=${base%% *}.$count; fi
+# Local builds reserve a weekly HeadVer; the release workflow supplies its own explicit version.
+if [[ -z ${GKSDUD_APP_VERSION:-} ]]; then
+  GKSDUD_APP_VERSION=$(ruby scripts/headver.rb)
 fi
 notary=()
 if [[ -n "${GKSDUD_NOTARY_PROFILE:-}" ]]; then
@@ -68,6 +61,7 @@ sign() {
   codesign --force "${sign_args[@]}" ${requirement[@]+"${requirement[@]}"} --identifier "$2" --options runtime "$1"
 }
 output_dir=${GKSDUD_OUTPUT_DIR:-"$PWD/outputs"}
+printf 'Build version: %s\n' "$GKSDUD_APP_VERSION"
 stage=$(mktemp -d /private/tmp/gksdud-build.XXXXXX)
 mkdir -p "$stage/$app.app/Contents/MacOS" "$stage/$app.app/Contents/Helpers" "$stage/$app.app/Contents/Resources" "$output_dir"
 swiftc -parse-as-library -D ICON_GENERATOR -module-cache-path "$stage/module-cache" DudIcon.swift -o "$stage/icon-generator"

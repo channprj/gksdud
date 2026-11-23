@@ -21,6 +21,12 @@ GKSDUD_SIGN_MODE=ad-hoc bash build.sh
 
 빌드 과정에서 테스트를 실행하고 `outputs/`에 ZIP을 만듭니다. 자동 테스트는 실제 HID 매핑이나 시스템 단축키를 변경하지 않습니다.
 
+버전을 지정하지 않은 로컬 빌드는 [LINE HeadVer](https://github.com/line/headver)의 `head.yearweek.build` 형식을 사용합니다. major는 `2`, 가운데 `YYWW`는 한국 시간 기준 ISO 연도·주차입니다. patch는 매주 월요일 0시 `0`부터 시작해 빌드할 때마다 증가합니다. 예를 들어 `2.2648.0`, `2.2648.1` 다음 주 첫 빌드는 `2.2649.0`입니다.
+
+카운터는 공통 Git 디렉터리의 `headver/counter`에 저장되어 같은 저장소의 작업 트리들이 번호를 공유합니다. 동시 빌드는 서로 다른 번호를 예약하며, 실패한 빌드의 번호도 재사용하지 않습니다. 이 파일을 지우면 번호 기록이 사라지므로 보관해주세요. 다른 저장소 복제본과는 공유하지 않습니다.
+
+릴리스 워크플로처럼 `GKSDUD_APP_VERSION`을 명시하면 해당 버전을 사용하며 로컬 카운터는 증가하지 않습니다. 버전 계산과 빌드 연결은 `ruby scripts/test_headver.rb`, `ruby scripts/test_release.rb`로 검증합니다.
+
 ## 검증
 
 실행 중인 gksdud를 종료하고 `outputs/`의 ZIP을 풀어 응용프로그램 폴더의 앱을 교체한 뒤 테스트합니다. ad-hoc 개발 빌드로 기존 설치본을 교체하면 접근성 권한을 다시 허용해야 할 수 있습니다.
